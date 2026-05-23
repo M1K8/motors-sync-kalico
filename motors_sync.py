@@ -327,9 +327,16 @@ class KinematicsParser:
         return kin_helper(config, sync)
 
 
-# Plug class for the Klipper version before add "motion_queuing"
-# module, and probably also for Kalico. May the gods forgive me.
-class DummyPrinterMotionQueuing:
+# Kalico-native motion adapter. Owns a private trapq and mirrors the
+# integration pattern used by Kalico's extras/force_move.ForceMove:
+# allocate trapq + cartesian stepper kinematics via chelper, swap the
+# target stepper onto them for the duration of the move, push moves
+# through trapq_append, call mcu_stepper.generate_steps(), then notify
+# the toolhead via note_mcu_movequeue_activity(). Functionally
+# equivalent to what Klipper's motion_queuing.PrinterMotionQueuing
+# provides for a single private queue (no shared steppersyncmgr is
+# required here because we never share this trapq with other modules).
+class KalicoMotionAdapter:
     def __init__(self, config):
         self.printer = config.get_printer()
         ffi_main, ffi_lib = chelper.get_ffi()
@@ -349,12 +356,69 @@ class DummyPrinterMotionQueuing:
         return self.trapq_append
 
     def note_mcu_movequeue_activity(self, ptime):
+        # Force-expire all moves on the private trapq so the iter-solver
+        # doesn't hold them past the manual move boundary; the toolhead
+        # is then told to advance its flush/step-gen times to "ptime".
         ctime = ptime + 99999.9
         self.trapq_finalize_moves(self.trapq, ctime, ctime)
         self.toolhead.note_mcu_movequeue_activity(ptime)
 
     def wipe_trapq(self, trapq):
         return
+
+
+# Detect which low-level motion API the running printer host exposes.
+# Returns ('kalico', None) when chelper has no steppersyncmgr_alloc
+# (Kalico's chelper does not declare it). Returns ('klipper', mq) when
+# chelper has steppersyncmgr_alloc AND a loadable extras/motion_queuing.
+# Raises a clear config error when the two sides are inconsistent (e.g.
+# a stray Klipper motion_queuing.py present on a Kalico chelper, which
+# was the failure mode observed in the field as
+# AttributeError: steppersyncmgr_alloc).
+def _resolve_motion_queue(printer, config):
+    ffi_main, ffi_lib = chelper.get_ffi()
+    has_mgr_sym = hasattr(ffi_lib, 'steppersyncmgr_alloc')
+    # Probe by Python module presence WITHOUT instantiating, so we
+    # never trigger Klipper-motion_queuing.PrinterMotionQueuing.__init__
+    # (which calls ffi_lib.steppersyncmgr_alloc()) on a host whose
+    # chelper does not provide that symbol.
+    mq_present = False
+    try:
+        importlib.util.find_spec
+    except AttributeError:
+        pass
+    # Two cases: (a) the module has already been loaded earlier by the
+    # host (Klipper auto-loads it from toolhead init), or (b) it just
+    # exists on disk in extras/.
+    if 'motion_queuing' in getattr(printer, 'objects', {}):
+        mq_present = True
+    else:
+        try:
+            from . import motion_queuing as _mq_probe  # noqa: F401
+            mq_present = True
+        except ImportError:
+            mq_present = False
+        except Exception:
+            # Import side effects unrelated to motors_sync should not
+            # mask the real platform mismatch; fall through to checks.
+            mq_present = True
+    if mq_present and not has_mgr_sym:
+        raise printer.config_error(
+            "motors_sync: Inconsistent host installation detected. "
+            "extras/motion_queuing.py is present, but the compiled "
+            "chelper does not export 'steppersyncmgr_alloc'. This "
+            "typically means a Klipper extras file was left in a "
+            "Kalico tree, or chelper was not rebuilt. Remove or "
+            "update extras/motion_queuing.py, or rebuild chelper to "
+            "match. motors_sync requires either a consistent "
+            "Klipper-with-motion_queuing tree, or a Kalico tree "
+            "without that module.")
+    if mq_present and has_mgr_sym:
+        # Safe to instantiate: chelper has the symbol the module needs.
+        mq = printer.load_object(config, 'motion_queuing', None)
+        if mq is not None:
+            return 'klipper', mq
+    return 'kalico', None
 
 
 # MCU_stepper manual enables and manual moves outside normal
@@ -366,10 +430,11 @@ class StepperManualMove:
     def __init__(self, config):
         self.printer = printer = config.get_printer()
         self.stepper_en = printer.load_object(config, 'stepper_enable')
-        self.motion_queuing = \
-            printer.load_object(config, 'motion_queuing', None)
-        if self.motion_queuing is None:
-            self.motion_queuing = DummyPrinterMotionQueuing(config)
+        backend, mq = _resolve_motion_queue(printer, config)
+        if backend == 'klipper':
+            self.motion_queuing = mq
+        else:
+            self.motion_queuing = KalicoMotionAdapter(config)
         self.trapq = self.motion_queuing.allocate_trapq()
         self.trapq_append = self.motion_queuing.lookup_trapq_append()
         ffi_main, ffi_lib = chelper.get_ffi()
