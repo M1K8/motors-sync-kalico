@@ -3,7 +3,7 @@
 # Copyright (C) 2024-2026  Maksim Bolgov <maksim8024@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, logging, traceback, itertools, csv, ast, importlib.util
+import os, time, logging, traceback, itertools, csv, ast, importlib.util
 import threading, multiprocessing
 from datetime import datetime
 import numpy as np
@@ -13,6 +13,7 @@ from .z_tilt import ZAdjustStatus
 PLOT_PATH = '~/printer_data/config/adxl_results/motors_sync'
 PIN_MIN_TIME = 0.010            # Minimum wait time to enable hardware pin
 MOTOR_STALL_TIME = 0.100        # Minimum wait time to enable motor pin
+LONG_SECTION_WARN = 0.100       # Log reactor-blocking sections longer than
 
 TRINAMIC_DRIVERS = ["tmc2130", "tmc2208", "tmc2209", "tmc2240", "tmc2660",
     "tmc5160"]
@@ -103,9 +104,16 @@ class BaseKinematics:
             self.msg_helper.done_msg(axis)
 
     def on_sync_error(self, axes):
+        # Runs while another exception is being handled: every axis is
+        # cleaned up even if one of them fails, and it never raises, so
+        # the original error is what reaches the user.
         for axis in axes:
-            axis.on_error()
-            self.msg_helper.done_msg(axis)
+            try:
+                axis.on_error()
+                self.msg_helper.done_msg(axis)
+            except Exception:
+                logging.exception(f"motors_sync: cleanup of axis "
+                                  f"'{axis.name}' failed")
 
     def run_sync(self, axes, force_run=False):
         self.home_rails(axes)
@@ -126,16 +134,21 @@ class BaseKinematics:
     def start_sync(self, axes=None, force_run=False):
         if axes is None:
             axes = list(self.motion_axes.values())
+        names = ','.join(a.name for a in axes)
+        logging.info(f"motors_sync: sync start axes={names}")
         try:
             self.run_sync(axes, force_run)
-        except Exception as e:
-            try:
-                self.on_sync_error(axes)
-            except:
-                raise Exception("Internal error in motors_sync")
+        except BaseException as e:
+            # BaseException too: a killed greenlet or a KeyboardInterrupt
+            # must not leave an accelerometer stream registered either.
             logging.error(f"Internal error in motors_sync:\n "
                           f"{traceback.format_exc()}")
+            self.on_sync_error(axes)
+            logging.info(f"motors_sync: sync aborted axes={names}")
+            if not isinstance(e, Exception):
+                raise
             raise self.gcode.error(str(e))
+        logging.info(f"motors_sync: sync done axes={names}")
 
     def axis_calibrate_cycle(self, m, peak_mstep, repeats):
         # "m" is a main single MotionAxis
@@ -364,7 +377,10 @@ class KalicoMotionAdapter:
         self.toolhead.note_mcu_movequeue_activity(ptime)
 
     def wipe_trapq(self, trapq):
-        return
+        # Nothing is left after a completed move (finalized above); this
+        # drops moves queued by a move that failed part way.
+        never = self.printer.get_reactor().NEVER
+        self.trapq_finalize_moves(trapq, never, never)
 
 
 # Detect which low-level motion API the running printer host exposes.
@@ -466,27 +482,87 @@ class StepperManualMove:
         self.toolhead.flush_step_generation()
         prev_sk = mcu_stepper.set_stepper_kinematics(self.stepper_kin)
         prev_trapq = mcu_stepper.set_trapq(self.trapq)
-        mcu_stepper.set_position((0., 0., 0.))
-        ptime = start_ptime = self.toolhead.get_last_move_time()
-        last_pos = 0.0
-        for move in moves:
-            if abs(move) < 0.00001:
-                continue
-            axis_r, accel_t, cruise_t, cruise_v = self.calc_move_time(
-                move, self.travel_speed, self.travel_accel)
-            self.trapq_append(
-                self.trapq, ptime, accel_t, cruise_t, accel_t, last_pos,
-                0., 0., axis_r, 0., 0., 0., cruise_v, self.travel_accel)
-            ptime = ptime + accel_t + cruise_t + accel_t
-            last_pos += move
-        if hasattr(mcu_stepper, 'generate_steps'):
-            mcu_stepper.generate_steps(ptime)
-        self.motion_queuing.note_mcu_movequeue_activity(ptime)
-        self.toolhead.dwell(ptime - start_ptime)
-        self.toolhead.flush_step_generation()
-        mcu_stepper.set_trapq(prev_trapq)
-        mcu_stepper.set_stepper_kinematics(prev_sk)
-        self.motion_queuing.wipe_trapq(self.trapq)
+        try:
+            mcu_stepper.set_position((0., 0., 0.))
+            ptime = start_ptime = self.toolhead.get_last_move_time()
+            last_pos = 0.0
+            for move in moves:
+                if abs(move) < 0.00001:
+                    continue
+                axis_r, accel_t, cruise_t, cruise_v = self.calc_move_time(
+                    move, self.travel_speed, self.travel_accel)
+                self.trapq_append(
+                    self.trapq, ptime, accel_t, cruise_t, accel_t, last_pos,
+                    0., 0., axis_r, 0., 0., 0., cruise_v, self.travel_accel)
+                ptime = ptime + accel_t + cruise_t + accel_t
+                last_pos += move
+            if hasattr(mcu_stepper, 'generate_steps'):
+                mcu_stepper.generate_steps(ptime)
+            self.motion_queuing.note_mcu_movequeue_activity(ptime)
+            self.toolhead.dwell(ptime - start_ptime)
+            self.toolhead.flush_step_generation()
+        finally:
+            # The stepper must go back to the toolhead's own kinematics
+            # and trapq even if the move failed, otherwise it silently
+            # stops following normal moves.
+            mcu_stepper.set_trapq(prev_trapq)
+            mcu_stepper.set_stepper_kinematics(prev_sk)
+            self.motion_queuing.wipe_trapq(self.trapq)
+
+
+# One bulk acquisition on a sensor chip, from start_measurements() to
+# finish_measurements(). The bulk helper has no remove_client(): a client
+# is unregistered when its callback returns False on a later batch. So
+# every start gets its own callback object; ending the session flips
+# "active" and the bulk helper drops the callback on its next batch.
+# A late batch can therefore never feed a newer session, and ending is
+# idempotent.
+class SensorSession:
+    def __init__(self, helper, session_id):
+        self.helper = helper
+        self.id = session_id
+        self.active = True
+        self.removed = False
+        self.batches = 0
+        self.samples = 0
+        self.late_batches = 0
+        self.start_time = helper.reactor.monotonic()
+        self.end_time = None
+        # Read once the chip's bulk run is up: starting it resets its
+        # counter, so a value taken earlier belongs to the previous run.
+        self.start_overflows = None
+
+    def handle_batch(self, batch):
+        if not self.active:
+            # Expected exactly once: this return value is what makes the
+            # bulk helper unregister the client.
+            self.late_batches += 1
+            if not self.removed:
+                self.removed = True
+                logging.info(
+                    f"motors_sync: {self.helper.chip_name} session "
+                    f"{self.id} unregistered "
+                    f"{self.helper.reactor.monotonic() - self.end_time:.3f}"
+                    f"s after finish")
+            return False
+        self.batches += 1
+        return self.helper._handle_batch(batch)
+
+    def end(self):
+        if not self.active:
+            return
+        self.active = False
+        self.end_time = self.helper.reactor.monotonic()
+        overflows = self.helper.get_chip_overflows()
+        new_overflows = None
+        if (overflows is not None and self.start_overflows is not None
+                and overflows >= self.start_overflows):
+            new_overflows = overflows - self.start_overflows
+        logging.info(
+            f"motors_sync: {self.helper.chip_name} session {self.id} "
+            f"finished after {self.end_time - self.start_time:.3f}s, "
+            f"batches={self.batches} samples={self.samples} "
+            f"chip_overflows_total={overflows} new={new_overflows}")
 
 
 # Base helper class for bulk sensors readings that measure the degree
@@ -502,12 +578,31 @@ class BaseSensorHelper:
         self.gcode = self.printer.lookup_object('gcode')
         self.reactor = self.printer.get_reactor()
         self.chip_config = None
-        self.is_finished = False
+        self.session = None
+        self.session_count = 0
         self.samples = []
         self.request_start_time = None
         self.request_end_time = None
         self._run_on_connect(self._handle_connect)
         self._run_on_connect(self._init_chip_config)
+
+    @property
+    def is_finished(self):
+        return self.session is None or not self.session.active
+
+    def get_chip_overflows(self):
+        # Read only: the chip's own possible-overflow total for its
+        # current bulk run, for diagnostics. None if not exposed.
+        try:
+            return self.chip_config.ffreader.get_last_overflows()
+        except Exception:
+            return None
+
+    def get_chip_mcu_name(self):
+        try:
+            return self.chip_config.mcu.get_name()
+        except Exception:
+            return None
 
     def _handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
@@ -526,16 +621,18 @@ class BaseSensorHelper:
         return self.chip_name
 
     def flush_data(self):
-        self.is_finished = False
+        # Only drops collected samples. Session state is deliberately not
+        # touched: this runs in the middle of a session (every
+        # measure_deviation) and must not re-arm a finished one.
         self.samples.clear()
         self.request_start_time = None
         self.request_end_time = None
 
     def _handle_batch(self, batch):
-        if self.is_finished:
-            return False
         samples = batch['data']
         self.samples.extend(samples)
+        if self.session is not None:
+            self.session.samples += len(samples)
         return True
 
     def update_start_time(self):
@@ -546,11 +643,43 @@ class BaseSensorHelper:
 
     def start_measurements(self):
         self.flush_data()
-        self.chip_config.batch_bulk.add_client(self._handle_batch)
+        prev = self.session
+        if prev is not None and prev.active:
+            logging.warning(
+                f"motors_sync: {self.chip_name} session {prev.id} was "
+                f"still active at the start of a new one, ending it")
+            prev.end()
+        elif prev is not None and not prev.removed:
+            logging.warning(
+                f"motors_sync: {self.chip_name} session {prev.id} "
+                f"finished {self.reactor.monotonic() - prev.end_time:.3f}s "
+                f"ago and the bulk helper has not unregistered it yet")
+        self.session_count += 1
+        session = SensorSession(self, self.session_count)
+        self.session = session
+        batch_bulk = self.chip_config.batch_bulk
+        try:
+            batch_bulk.add_client(session.handle_batch)
+        except BaseException:
+            session.end()
+            raise
+        session.start_overflows = self.get_chip_overflows()
+        logging.info(
+            f"motors_sync: {self.chip_name} session {session.id} started "
+            f"mcu={self.get_chip_mcu_name()} "
+            f"chip_overflows_total={session.start_overflows} "
+            f"bulk_clients={len(getattr(batch_bulk, 'client_cbs', ()))}")
 
     def finish_measurements(self):
-        self.toolhead.wait_moves()
-        self.is_finished = True
+        # Idempotent, and ends the session even if waiting for the moves
+        # fails: the stream must not outlive the sync.
+        session = self.session
+        if session is None or not session.active:
+            return
+        try:
+            self.toolhead.wait_moves()
+        finally:
+            session.end()
 
     def _wait_samples(self):
         now = self.reactor.monotonic()
@@ -566,14 +695,25 @@ class BaseSensorHelper:
             if now > wait_limit:
                 raise Exception(f"No data from '{self.chip_name}'")
 
+    def _note_blocking(self, start_t, what):
+        # Everything after the last reactor.pause() runs without yielding
+        # to the reactor, so a long one delays every other host timer.
+        elapsed = time.perf_counter() - start_t
+        if elapsed > LONG_SECTION_WARN:
+            logging.warning(f"motors_sync: {self.chip_name} {what} blocked "
+                            f"the reactor for {elapsed:.3f}s")
+
     def _get_samples(self):
         self._wait_samples()
+        start_t = time.perf_counter()
         raw_data = np.array(self.samples)
         start_idx = np.searchsorted(raw_data[:, 0],
                     self.request_start_time, side='left')
         end_idx = np.searchsorted(raw_data[:, 0],
                     self.request_end_time, side='right')
-        return raw_data[start_idx:end_idx][:, 1:]
+        res = raw_data[start_idx:end_idx][:, 1:]
+        self._note_blocking(start_t, "sample conversion")
+        return res
 
     def measure_deviation(self):
         # Measure the impact
@@ -662,6 +802,7 @@ class AccelHelper(BaseSensorHelper):
     def calc_deviation(self):
         # Calculate impact magnitude
         vects = self._get_samples()
+        start_t = time.perf_counter()
         vects_len = vects.shape[0]
         # Kalman filter may distort the first values, or in some
         # cases there may be residual values of toolhead inertia.
@@ -678,6 +819,7 @@ class AccelHelper(BaseSensorHelper):
         # Return avg of 5 max magnitudes with deduction static
         magnitude = np.mean(np.sort(magnitudes)[-5:])
         magnitude = np.around(magnitude - static, 2)
+        self._note_blocking(start_t, f"deviation calc ({vects_len} samples)")
         return magnitude
 
     def detect_move_dir(self):
@@ -725,6 +867,7 @@ class BeaconAccelHelper(AccelHelper):
     def _handle_batch(self, batches):
         # Beacon "_api_dump" send data in an additional array
         hb = super()._handle_batch
+        res = True
         for batch in batches:
             res = hb(batch)
         return res
@@ -1448,11 +1591,24 @@ class MotionAxis:
         self.stats_helper.write_axis_stats_log(self, True)
 
     def on_error(self):
-        self.fan.toggle(True)
-        self.chip_helper.finish_measurements()
-        self.toggle_self_steppers(1)
-        self.toggle_conflict_steppers(1)
-        self.stats_helper.write_axis_stats_log(self, False)
+        # Error cleanup: each step is independent, so one failing must
+        # not skip the others (fans back on, acquisition stopped, motors
+        # restored). Failures are logged; the caller keeps the original
+        # error.
+        for what, step in (
+                ("fan restore", lambda: self.fan.toggle(True)),
+                ("stop measurements", self.chip_helper.finish_measurements),
+                ("self steppers", lambda: self.toggle_self_steppers(1)),
+                ("conflict steppers",
+                 lambda: self.toggle_conflict_steppers(1)),
+                ("stats log",
+                 lambda: self.stats_helper.write_axis_stats_log(
+                     self, False))):
+            try:
+                step()
+            except Exception:
+                logging.exception(f"motors_sync: {self.name_prefixed} "
+                                  f"error cleanup '{what}' failed")
 
 
 # Main entry point for motors synchronization feature. Initializes

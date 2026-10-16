@@ -1,0 +1,93 @@
+From 173803993d44e84052edd7b1659ded91da23d620 Mon Sep 17 00:00:00 2001
+From: charliemayall <81966433+charliemayall@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 14:50:38 +0100
+Subject: [PATCH] fix: load_cell - report per-batch overflow deltas
+
+Probe tare summed lifetime overflow totals each batch, so a brief
+MCU backlog under SYNC_MOTORS could poison probing for the rest of
+the session. Report only new errors/overflows per batch instead.
+---
+ klippy/extras/load_cell/ads1220.py    | 6 ++++--
+ klippy/extras/load_cell/ads131m0x.py  | 9 ++++++---
+ klippy/extras/load_cell/hx71x.py      | 4 ++--
+ klippy/extras/load_cell/interfaces.py | 6 +++++-
+ 4 files changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/klippy/extras/load_cell/ads1220.py b/klippy/extras/load_cell/ads1220.py
+index 75a528a3..ba2ccc5b 100644
+--- a/klippy/extras/load_cell/ads1220.py
++++ b/klippy/extras/load_cell/ads1220.py
+@@ -234,12 +234,14 @@ class ADS1220(LoadCellSensor):
+         logging.info("ADS1220 finished '%s' measurements", self.name)
+ 
+     def _process_batch(self, eventtime) -> BulkAdcData:
++        prev_overflows = self.ffreader.get_last_overflows()
++        prev_error_count = self.last_error_count
+         samples = self.ffreader.pull_samples()
+         self._convert_samples(samples)
+         return {
+             "data": samples,
+-            "errors": self.last_error_count,
+-            "overflows": self.ffreader.get_last_overflows(),
++            "errors": self.last_error_count - prev_error_count,
++            "overflows": self.ffreader.get_last_overflows() - prev_overflows,
+         }
+ 
+     def reset_chip(self):
+diff --git a/klippy/extras/load_cell/ads131m0x.py b/klippy/extras/load_cell/ads131m0x.py
+index 914540d8..1dba95a1 100644
+--- a/klippy/extras/load_cell/ads131m0x.py
++++ b/klippy/extras/load_cell/ads131m0x.py
+@@ -256,11 +256,14 @@ class ADS131MxBase(LoadCellSensor):
+         logging.info(f"{self.sensor_type} finished '{self.name}' measurements")
+ 
+     def _process_batch(self, eventtime):
++        prev_overflows = self.ffreader.get_last_overflows()
++        prev_error_count = self.last_error_count
+         samples = self.ffreader.pull_samples()
++        data = self._convert_samples(samples)
+         return {
+-            "data": self._convert_samples(samples),
+-            "errors": self.last_error_count,
+-            "overflows": self.ffreader.get_last_overflows(),
++            "data": data,
++            "errors": self.last_error_count - prev_error_count,
++            "overflows": self.ffreader.get_last_overflows() - prev_overflows,
+         }
+ 
+     # --- SPI Communication Helpers ---
+diff --git a/klippy/extras/load_cell/hx71x.py b/klippy/extras/load_cell/hx71x.py
+index b8b43126..45c927d2 100644
+--- a/klippy/extras/load_cell/hx71x.py
++++ b/klippy/extras/load_cell/hx71x.py
+@@ -176,8 +176,8 @@ class HX71xBase(LoadCellSensor):
+             self.consecutive_fails = 0
+         return {
+             "data": samples,
+-            "errors": self.last_error_count,
+-            "overflows": self.ffreader.get_last_overflows(),
++            "errors": errors,
++            "overflows": overflows,
+         }
+ 
+ 
+diff --git a/klippy/extras/load_cell/interfaces.py b/klippy/extras/load_cell/interfaces.py
+index 6ab0446f..4d542658 100644
+--- a/klippy/extras/load_cell/interfaces.py
++++ b/klippy/extras/load_cell/interfaces.py
+@@ -12,7 +12,11 @@ from klippy.mcu import MCU
+ 
+ 
+ class BulkAdcData(TypedDict):
+-    """Dictionary returned by sensors containing raw sensor data"""
++    """Dictionary returned by sensors containing raw sensor data.
++
++    `errors` and `overflows` are counts new to this batch only (deltas since
++    the previous batch), not lifetime totals since measurements started.
++    """
+ 
+     data: list[tuple[float, ...]]
+     errors: int
+-- 
+2.43.0
+

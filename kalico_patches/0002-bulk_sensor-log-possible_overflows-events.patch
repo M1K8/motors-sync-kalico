@@ -1,0 +1,42 @@
+From: Claude Code <noreply@anthropic.com>
+Subject: [PATCH] bulk_sensor: log possible_overflows events
+
+Diagnostic only. Logs the first overflow of a bulk run and then each
+time the run total reaches a power of two (raw mcu counter and delta).
+---
+diff --git a/klippy/extras/bulk_sensor.py b/klippy/extras/bulk_sensor.py
+index 489997f..aadfe0b 100644
+--- a/klippy/extras/bulk_sensor.py
++++ b/klippy/extras/bulk_sensor.py
+@@ -287,6 +287,22 @@ class FixedFreqReader:
+         # Clear local queue (free no longer needed memory)
+         self.bulk_queue.clear_queue()
+ 
++    def _note_overflows(self, mcu_total, delta):
++        # Event log (not per sample or batch): the first overflow of a
++        # bulk run, then each time the run total reaches a new power of
++        # two. "possible_overflows" counts occasions where the mcu found
++        # the previous sample still unread, not an exact lost sample count.
++        total = self.last_overflows
++        if total == delta or total.bit_length() > (total - delta).bit_length():
++            logging.warning(
++                "bulk_sensor: oid=%s possible_overflows +%d"
++                " (run total %d, mcu counter %d)",
++                self.oid,
++                delta,
++                total,
++                mcu_total,
++            )
++
+     def _update_clock(self, is_reset=False):
+         params = self.query_status_cmd.send([self.oid])
+         mcu_clock = self.mcu.clock32_to_clock64(params["clock"])
+@@ -295,6 +311,8 @@ class FixedFreqReader:
+         buffered = params["buffered"]
+         po_diff = (params["possible_overflows"] - self.last_overflows) & 0xFFFF
+         self.last_overflows += po_diff
++        if po_diff:
++            self._note_overflows(params["possible_overflows"], po_diff)
+         duration = params["query_ticks"]
+         if duration > self.max_query_duration:
+             # Skip measurement as a high query time could skew clock tracking
