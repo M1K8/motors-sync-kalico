@@ -1,3 +1,5 @@
 motors_sync/*
 .idea/*
 *.csv
+__pycache__/
+.pytest_cache/
